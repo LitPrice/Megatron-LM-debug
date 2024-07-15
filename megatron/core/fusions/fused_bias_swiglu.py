@@ -16,7 +16,7 @@ def swiglu(y):
 
 @jit_fuser
 def bias_swiglu(y, bias):
-    y = y + bias
+    y = y # + bias
     return swiglu(y)
 
 
@@ -33,7 +33,7 @@ def swiglu_back(g, y):
 
 @jit_fuser
 def bias_swiglu_back(g, y, bias):
-    y = y + bias
+    y = y # + bias
     return swiglu_back(g, y)
 
 

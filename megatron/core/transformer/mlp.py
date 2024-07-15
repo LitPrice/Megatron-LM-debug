@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.dist_checkpointing.mapping import (
     ReplicaId,
@@ -64,32 +64,55 @@ class MLP(MegatronModule):
         if self.config.gated_linear_unit:
             ffn_hidden_size *= 2
 
-        self.linear_fc1 = build_module(
-            submodules.linear_fc1,
+        # self.linear_fc1 = build_module(
+        #     submodules.linear_fc1,
+        #     self.input_size,
+        #     ffn_hidden_size,
+        #     config=self.config,
+        #     init_method=self.config.init_method,
+        #     gather_output=False,
+        #     bias=self.config.add_bias_linear,
+        #     skip_bias_add=True,
+        #     is_expert=is_expert,
+        #     tp_comm_buffer_name='fc1',
+        # )
+        self.linear_fc1 = tensor_parallel.ColumnParallelLinear(
+            # config.hidden_size,
             self.input_size,
             ffn_hidden_size,
             config=self.config,
             init_method=self.config.init_method,
-            gather_output=False,
             bias=self.config.add_bias_linear,
+            gather_output=False,
             skip_bias_add=True,
-            is_expert=is_expert,
-            tp_comm_buffer_name='fc1',
+            # moe=moe,
+            # enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
         )
 
         self.activation_func = self.config.activation_func
 
-        self.linear_fc2 = build_module(
-            submodules.linear_fc2,
+        # self.linear_fc2 = build_module(
+        #     submodules.linear_fc2,
+        #     self.config.ffn_hidden_size,
+        #     self.config.hidden_size,
+        #     config=self.config,
+        #     init_method=self.config.output_layer_init_method,
+        #     bias=self.config.add_bias_linear,
+        #     input_is_parallel=True,
+        #     skip_bias_add=True,
+        #     is_expert=is_expert,
+        #     tp_comm_buffer_name='fc2',
+        # )
+        self.linear_fc2 = tensor_parallel.RowParallelLinear(
             self.config.ffn_hidden_size,
             self.config.hidden_size,
             config=self.config,
             init_method=self.config.output_layer_init_method,
             bias=self.config.add_bias_linear,
             input_is_parallel=True,
-            skip_bias_add=True,
-            is_expert=is_expert,
-            tp_comm_buffer_name='fc2',
+            skip_bias_add=False
+            # moe=moe,
+            # enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
         )
 
     def forward(self, hidden_states):
@@ -110,6 +133,9 @@ class MLP(MegatronModule):
                     bias_parallel,
                     self.config.activation_func_fp8_input_store,
                 )
+                # (gate, up_proj) = tensor_parallel.utils.split_tensor_along_last_dim(
+                #     intermediate_parallel, 2, contiguous_split_chunks=True)
+                # intermediate_parallel = F.silu(gate) * up_proj
             else:
                 raise ValueError("Only support fusion of gelu and swiglu")
         else:

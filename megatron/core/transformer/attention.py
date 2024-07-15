@@ -8,7 +8,7 @@ import torch
 from pkg_resources import packaging
 
 from megatron.core import parallel_state, tensor_parallel
-from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb
+from megatron.core.models.common.embeddings.rotary_pos_embedding import apply_rotary_pos_emb, apply_rotary_pos_emb_torch
 from megatron.core.parallel_state import (
     get_data_parallel_group,
     get_data_parallel_rank,
@@ -291,24 +291,30 @@ class Attention(MegatronModule, ABC):
         # ================================================
         if rotary_pos_emb is not None:
             q_pos_emb, k_pos_emb = rotary_pos_emb
+            offset, position_ids = 0, None
 
             if packed_seq_params is not None:
                 cu_seqlens_q = packed_seq_params.cu_seqlens_q
                 cu_seqlens_kv = packed_seq_params.cu_seqlens_kv
             else:
                 cu_seqlens_q = cu_seqlens_kv = None
-            query = apply_rotary_pos_emb(
-                query,
-                q_pos_emb,
-                config=self.config,
-                cu_seqlens=cu_seqlens_q,
-            )
-            key = apply_rotary_pos_emb(
-                key,
-                k_pos_emb,
-                config=self.config,
-                cu_seqlens=cu_seqlens_kv,
-            )
+            query = query.squeeze(1)
+            key = key.squeeze(1)
+            # query = apply_rotary_pos_emb(
+            #     query,
+            #     q_pos_emb,
+            #     config=self.config,
+            #     cu_seqlens=cu_seqlens_q,
+            # )
+            # key = apply_rotary_pos_emb(
+            #     key,
+            #     k_pos_emb,
+            #     config=self.config,
+            #     cu_seqlens=cu_seqlens_kv,
+            # )
+            query, key = apply_rotary_pos_emb_torch(query, key, q_pos_emb, k_pos_emb, offset=offset, position_ids=position_ids) # noqa
+            query = query.unsqueeze(1)
+            key = key.unsqueeze(1)
 
             # TODO, can apply positional embedding to value_layer so it has
             # absolute positional embedding.
@@ -376,18 +382,25 @@ class SelfAttention(Attention):
             attention_type="self",
         )
 
-        self.linear_qkv = build_module(
-            submodules.linear_qkv,
+        # self.linear_qkv = build_module(
+        #     submodules.linear_qkv,
+        #     self.config.hidden_size,
+        #     self.query_projection_size + 2 * self.kv_projection_size,
+        #     config=self.config,
+        #     init_method=self.config.init_method,
+        #     gather_output=False,
+        #     bias=self.config.add_bias_linear or self.config.add_qkv_bias,
+        #     skip_bias_add=False,
+        #     is_expert=False,
+        #     tp_comm_buffer_name='qkv',
+        # )
+        self.linear_qkv = tensor_parallel.ColumnParallelLinear(
             self.config.hidden_size,
             self.query_projection_size + 2 * self.kv_projection_size,
             config=self.config,
             init_method=self.config.init_method,
-            gather_output=False,
-            bias=self.config.add_bias_linear or self.config.add_qkv_bias,
-            skip_bias_add=False,
-            is_expert=False,
-            tp_comm_buffer_name='qkv',
-        )
+            bias=self.config.add_qkv_bias,
+            gather_output=False) 
 
         if submodules.q_layernorm is not None:
             self.q_layernorm = build_module(

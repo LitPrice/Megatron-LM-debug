@@ -41,6 +41,8 @@ except ImportError:
     warnings.warn(f'Apex is not installed. Falling back to Torch LayerNorm')
     LNImpl = WrappedTorchLayerNorm
 
+from megatron.legacy.model import LayerNorm, RMSNorm
+
 
 # Use this spec to use lower level Transformer Engine modules (required for fp8 training)
 def get_gpt_layer_with_transformer_engine_spec(
@@ -52,6 +54,7 @@ def get_gpt_layer_with_transformer_engine_spec(
     return ModuleSpec(
         module=TransformerLayer,
         submodules=TransformerLayerSubmodules(
+            input_layernorm=RMSNorm,
             self_attention=ModuleSpec(
                 module=SelfAttention,
                 params={"attn_mask_type": AttnMaskType.causal},
@@ -66,7 +69,7 @@ def get_gpt_layer_with_transformer_engine_spec(
                 ),
             ),
             self_attn_bda=get_bias_dropout_add,
-            pre_mlp_layernorm=TENorm if num_experts else IdentityOp,
+            pre_mlp_layernorm=RMSNorm, # TENorm if num_experts else IdentityOp,
             mlp=mlp,
             mlp_bda=get_bias_dropout_add,
         ),

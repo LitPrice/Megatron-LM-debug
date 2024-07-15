@@ -44,6 +44,8 @@ except ImportError:
 
         LayerNormImpl = WrappedTorchLayerNorm
 
+from megatron.legacy.model import LayerNorm, RMSNorm
+
 
 def get_num_layers_to_build(config: TransformerConfig) -> int:
 
@@ -104,7 +106,7 @@ def _get_block_submodules(
             num_layers = get_num_layers_to_build(config)
             return TransformerBlockSubmodules(
                 layer_specs=[spec] * num_layers,
-                layer_norm=LayerNormImpl,
+                layer_norm=RMSNorm, # LayerNormImpl,
             )
         else:
             raise Exception(f"specialize for {spec.module.__name__}.")
@@ -205,11 +207,17 @@ class TransformerBlock(MegatronModule):
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
         if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+            # self.final_layernorm = build_module(
+            #     self.submodules.layer_norm,
+            #     config=self.config,
+            #     hidden_size=self.config.hidden_size,
+            #     eps=self.config.layernorm_epsilon,
+            # )
             self.final_layernorm = build_module(
                 self.submodules.layer_norm,
-                config=self.config,
-                hidden_size=self.config.hidden_size,
+                dim=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
+                sequence_parallel=self.config.sequence_parallel
             )
         else:
             self.final_layernorm = None  # Either this or nn.Identity

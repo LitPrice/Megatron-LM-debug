@@ -3,6 +3,12 @@
 import torch
 from torch import nn
 
+try:
+    from flash_attn.ops.rms_norm import rms_norm as flash_attn_rms_norm
+except ImportError:
+    flash_attn_rms_norm = None
+
+
 class RMSNorm(torch.nn.Module):
 
     def __init__(self,
@@ -27,5 +33,8 @@ class RMSNorm(torch.nn.Module):
         return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
 
     def forward(self, x):
+        if flash_attn_rms_norm and x.shape[-1] <= 8192:
+            return flash_attn_rms_norm(x, self.weight, self.eps)
+
         output = self._norm(x.float()).type_as(x)
         return output * self.weight

@@ -9,7 +9,7 @@ from torch import Tensor
 from megatron.core import InferenceParams, parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.models.common.embeddings.language_model_embedding import LanguageModelEmbedding
-from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding, RotaryEmbeddingOld
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnMaskType, ModelType
@@ -83,13 +83,18 @@ class GPTModel(LanguageModule):
             )
 
         if self.position_embedding_type == 'rope':
-            self.rotary_pos_emb = RotaryEmbedding(
-                kv_channels=self.config.kv_channels,
-                rotary_percent=rotary_percent,
-                rotary_interleaved=self.config.rotary_interleaved,
-                seq_len_interpolation_factor=seq_len_interpolation_factor,
-                rotary_base=rotary_base,
-            )
+            if hasattr(self.config, 'kv_channel'):
+                rotary_dim = self.config.kv_channel
+            else:
+                rotary_dim = self.config.hidden_size // self.config.num_attention_heads
+            self.rotary_pos_emb = RotaryEmbedding(rotary_dim, precision=torch.bfloat16)
+            # self.rotary_pos_emb = RotaryEmbeddingOld(
+            #     kv_channels=self.config.kv_channels,
+            #     rotary_percent=rotary_percent,
+            #     rotary_interleaved=self.config.rotary_interleaved,
+            #     seq_len_interpolation_factor=seq_len_interpolation_factor,
+            #     rotary_base=rotary_base,
+            # )
 
         # Transformer.
         self.decoder = TransformerBlock(
@@ -172,18 +177,32 @@ class GPTModel(LanguageModule):
         if decoder_input is not None:
             pass
         elif self.pre_process:
+            # import numpy as np
+            # input_ids = torch.from_numpy(np.load("input_ids.npy")).cuda()
+            input_ids = input_ids.clamp(max=31999)
             decoder_input = self.embedding(input_ids=input_ids, position_ids=position_ids)
         else:
             # intermediate stage of pipeline
             # decoder will get hidden_states from encoder.input_tensor
             decoder_input = None
 
+        # import pdb;pdb.set_trace()
         # Rotary positional embeddings (embedding is None for PP intermediate devices)
         rotary_pos_emb = None
         if self.position_embedding_type == 'rope':
-            rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
-                inference_params, self.decoder, decoder_input, self.config
-            )
+            # rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(
+            #     inference_params, self.decoder, decoder_input, self.config
+            # )
+            if self.decoder.input_tensor is not None:
+                rotary_seq_len = self.decoder.input_tensor.size(0)
+            else:
+                rotary_seq_len = decoder_input.size(0)
+
+            if self.config.sequence_parallel:
+                rotary_seq_len *= self.config.tensor_model_parallel_size
+
+            rotary_seq_len *= self.config.context_parallel_size
+            # rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
             rotary_pos_emb = self.rotary_pos_emb(rotary_seq_len)
 
         # Run decoder.
@@ -209,6 +228,8 @@ class GPTModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
+        # import numpy as np
+        # labels = torch.from_numpy(np.load("labels.npy")).cuda()
         loss = self.compute_language_model_loss(labels, logits)
 
         return loss

@@ -522,6 +522,267 @@ def get_optimizer_param_scheduler(optimizer):
     return opt_param_scheduler
 
 
+import glob
+from megatron.core import mpu
+
+class NotDivisibleError(Exception):
+    def __init__(self, denominator, molecule, error_info):
+        super().__init__()
+        self._error_info = error_info
+        self._molecule = molecule
+        self._denominator = denominator
+
+    def __str__(self):
+        if self._error_info is None:
+            return f"{self._denominator} is not divisible by {self._molecule}"
+        else:
+            return self._error_info.format(self._denominator, self._molecule)
+
+def check_divisible(denominator, molecule, error_info=None):
+    if denominator % molecule == 0:
+        return
+    raise NotDivisibleError(denominator, molecule, error_info)
+
+class NotEqualError(Exception):
+    def __init__(self, tensor_a, tensor_b, error_info):
+        super().__init__()
+        self._error_info = error_info
+        self._tensor_a = tensor_a
+        self._tensor_b = tensor_b
+
+    def __str__(self):
+        if self._error_info is None:
+            return f"{self._tensor_a} is not equal to {self._tensor_b}"
+        else:
+            return self._error_info.format(self._tensor_a, self._tensor_b)
+
+
+def check_equal(tensor_a, tensor_b, error_info=None):
+    if tensor_a == tensor_b:
+        return
+    raise NotEqualError(tensor_a, tensor_b, error_info)
+
+
+def column_split(w, tp, r):
+    if w is None:
+        return None
+    dim1 = w.shape[1]
+    check_divisible(dim1, tp)
+    part_len = dim1 // tp
+    return w[:, r * part_len: (r + 1) * part_len].clone()
+
+
+def permute_qkv_weight(w, model_config, split=False):
+    """
+    adapt for ascendspeed llama qkv layer
+    Notation:
+        n_head: Number of attention heads,
+        kv_heads: Number of key and value heads,
+        tp: Tensor model parallel size,
+        np: Number of attention heads in per tensor partition,
+        gp: Number of key and value heads in per tensor partition,
+    """
+    n_head, hidden_size, tp, kv_heads = model_config
+    if kv_heads is None:
+        kv_heads = n_head
+
+    check_divisible(n_head, tp)
+    check_divisible(hidden_size, n_head)
+    check_divisible(kv_heads, tp)
+    check_divisible(n_head, kv_heads)
+    np = n_head // tp
+    gp = kv_heads // tp
+    repeats = np // gp
+    hn = hidden_size // n_head
+    w_s0, w_s1 = w.shape
+    check_equal(w_s0, (repeats + 2) * gp * hn)
+    if not split:
+        q, k, v = w.split([gp * repeats * hn, gp * hn, gp * hn], 0)
+        return torch.cat([q.reshape(gp, repeats * hn, -1),
+                          k.reshape(gp, hn, -1),
+                          v.reshape(gp, hn, -1)], 1).reshape(w_s0, w_s1).contiguous().clone()
+    q, k, v = w.reshape(gp, -1, w_s1).split([repeats * hn, hn, hn], 1)
+    return torch.cat([q.reshape(-1, w_s1),
+                      k.reshape(-1, w_s1),
+                      v.reshape(-1, w_s1)], 0).reshape(w_s0, w_s1).contiguous().clone()
+
+
+def row_split(w, tp, r):
+    if w is None:
+        return None
+    h = w.shape[0]
+    check_divisible(h, tp)
+    part_len = h // tp
+    return w[r * part_len: (r + 1) * part_len, ...].clone()
+
+def get_weight_from(weight_map, layer_name):
+    if layer_name in weight_map:
+        return weight_map[layer_name]
+    return None
+
+def load_ckpt_from_pretrain(_args, model, optimizer, tp_rank, tp_size, pp_rank, pp_size, n_layer, hidden_size, n_heads, num_kv_heads, pretrain_type):
+    load_dir = _args.load
+    filenames = glob.glob(os.path.join(load_dir, '*.bin'))
+    # for ceph & safetensors support
+    if len(filenames) == 0:
+        filenames = glob.glob(os.path.join(load_dir, '*.safetensors'))
+        # if len(filenames) == 0:
+        #     ceph_filenames = glob.glob(os.path.join(load_dir, '*.ceph'))
+        #     if len(ceph_filenames) > 0:
+        #         ceph_paths = []
+        #         for item in ceph_filenames:
+        #             with open(item, "r") as f:
+        #                 ceph_paths.append(f.readlines()[0].strip())
+        #         filenames = ceph_paths
+        #     else:
+        #         return False
+
+    def reader(filename):
+        # logger.info(f"loadding {filename}")
+        # if "s3://" in filename:
+        #     dt = PetrelHelper.load(filename, map_location='cpu')
+        if filename.endswith(".safetensors"):
+            from safetensors.torch import load_file as safe_load_file
+            dt = safe_load_file(filename)
+        else:
+            dt = torch.load(filename, map_location='cpu')
+        return dt
+
+    input_models_map = {f: reader(f) for f in filenames}
+    weight_map, total_count = {}, 0
+    for key in input_models_map:
+        total_count += len(input_models_map[key])
+        weight_map = {**weight_map, **input_models_map[key]}
+    assert len(weight_map) == total_count
+    from functools import partial
+
+    get_weight_from_name = partial(get_weight_from, weight_map)
+
+    pp_n_layer = n_layer // pp_size
+    if pretrain_type == 'llama':
+        emb_w = get_weight_from_name("model.embed_tokens.weight")
+    if pretrain_type == 'internlm2':
+        emb_w = get_weight_from_name("model.tok_embeddings.weight")
+    # emb_w = pad_embed(emb_w, make_vocab_size_divisible_by, tp_size, added_token_num)
+    state_dict = model[0].state_dict()
+    if pp_rank == 0:
+        # state_dict["language_model.embedding.word_embeddings.weight"].copy_(row_split(emb_w, tp_size, tp_rank))
+        state_dict["embedding.word_embeddings.weight"].copy_(row_split(emb_w, tp_size, tp_rank))
+
+    if pp_rank == pp_size - 1:
+        if pretrain_type == 'llama':
+            # state_dict["language_model.encoder.final_layernorm.weight"].copy_(get_weight_from_name("model.norm.weight").clone())
+            state_dict["decoder.final_layernorm.weight"].copy_(get_weight_from_name("model.norm.weight").clone())
+            # state_dict["language_model.output_layer.weight"].copy_(row_split(get_weight_from_name("lm_head.weight"), tp_size, tp_rank))
+            state_dict["output_layer.weight"].copy_(row_split(get_weight_from_name("lm_head.weight"), tp_size, tp_rank))
+        if pretrain_type == 'internlm2':
+            state_dict["language_model.encoder.final_layernorm.weight"].copy_(get_weight_from_name("model.norm.weight").clone())
+            state_dict["language_model.output_layer.weight"].copy_(row_split(get_weight_from_name("output.weight"), tp_size, tp_rank))    
+        # state_dict["language_model.output_layer.weight"].copy_(row_split(
+        #     pad_embed(get_weight_from_name("lm_head.weight"), make_vocab_size_divisible_by,
+        #                 tp_size, added_token_num), tp_size, tp_rank))
+    def layer_update(pp_i):
+        ori_i = pp_n_layer * pp_rank + pp_i
+        qw = row_split(get_weight_from_name(f"model.layers.{ori_i}.self_attn.q_proj.weight"), tp_size, tp_rank)
+        kw = row_split(get_weight_from_name(f"model.layers.{ori_i}.self_attn.k_proj.weight"), tp_size, tp_rank)
+        vw = row_split(get_weight_from_name(f"model.layers.{ori_i}.self_attn.v_proj.weight"), tp_size, tp_rank)
+        permute_w = permute_qkv_weight(torch.cat([qw, kw, vw], dim=0), (n_heads, hidden_size, tp_size, num_kv_heads))
+        # state_dict[f"language_model.encoder.layers.{pp_i}.self_attention.query_key_value.weight"].copy_(permute_w)
+        state_dict[f"decoder.layers.{pp_i}.self_attention.linear_qkv.weight"].copy_(permute_w)
+        # state_dict[f"language_model.encoder.layers.{pp_i}.self_attention.dense.weight"].copy_(column_split(
+        #     get_weight_from_name(f"model.layers.{ori_i}.self_attn.o_proj.weight"), tp_size, tp_rank))
+        state_dict[f"decoder.layers.{pp_i}.self_attention.linear_proj.weight"].copy_(column_split(
+            get_weight_from_name(f"model.layers.{ori_i}.self_attn.o_proj.weight"), tp_size, tp_rank))
+
+        gate_proj = row_split(
+            get_weight_from_name(f"model.layers.{ori_i}.mlp.gate_proj.weight"), tp_size, tp_rank)
+        up_proj = row_split(
+            get_weight_from_name(f"model.layers.{ori_i}.mlp.up_proj.weight"), tp_size, tp_rank)
+        # state_dict[f"language_model.encoder.layers.{pp_i}.mlp.proj.weight"].copy_(torch.cat(
+        #     [gate_proj, up_proj], 0).contiguous().clone())
+        # state_dict[f"decoder.layers.{pp_i}.mlp.proj.weight"].copy_(torch.cat(
+        #     [gate_proj, up_proj], 0).contiguous().clone())
+        state_dict[f"decoder.layers.{pp_i}.mlp.linear_fc1.weight"].copy_(torch.cat(
+            [gate_proj, up_proj], 0).contiguous().clone())
+        # state_dict[f"language_model.encoder.layers.{pp_i}.mlp.dense_4h_to_h.weight"].copy_(column_split(
+        #     get_weight_from_name(f"model.layers.{ori_i}.mlp.down_proj.weight"), tp_size, tp_rank))
+        # state_dict[f"decoder.layers.{pp_i}.mlp.dense_4h_to_h.weight"].copy_(column_split(
+        #     get_weight_from_name(f"model.layers.{ori_i}.mlp.down_proj.weight"), tp_size, tp_rank))
+        state_dict[f"decoder.layers.{pp_i}.mlp.linear_fc2.weight"].copy_(column_split(
+            get_weight_from_name(f"model.layers.{ori_i}.mlp.down_proj.weight"), tp_size, tp_rank))
+        # state_dict[f"language_model.encoder.layers.{pp_i}.input_layernorm.weight"].copy_(get_weight_from_name(
+        #     f"model.layers.{ori_i}.input_layernorm.weight").clone())
+        state_dict[f"decoder.layers.{pp_i}.input_layernorm.weight"].copy_(get_weight_from_name(
+            f"model.layers.{ori_i}.input_layernorm.weight").clone())
+        # state_dict[f"language_model.encoder.layers.{pp_i}.post_attention_layernorm.weight"].copy_(get_weight_from_name(
+        #     f"model.layers.{ori_i}.post_attention_layernorm.weight").clone())
+        state_dict[f"decoder.layers.{pp_i}.pre_mlp_layernorm.weight"].copy_(get_weight_from_name(
+            f"model.layers.{ori_i}.post_attention_layernorm.weight").clone())
+
+    def internlm2_layer_update(pp_i):
+        ori_i = pp_n_layer * pp_rank + pp_i
+        qkv = get_weight_from_name(f"model.layers.{ori_i}.attention.wqkv.weight")
+        gs = n_heads // num_kv_heads
+        head_dim = hidden_size // n_heads
+        qkv = qkv.reshape(-1, gs + 2, head_dim, hidden_size)
+        qw = row_split(qkv[:, :gs, ...], tp_size, tp_rank).reshape(-1, hidden_size)
+        kw = row_split(qkv[:, -2, ...], tp_size, tp_rank).reshape(-1, hidden_size)
+        vw = row_split(qkv[:, -1, ...], tp_size, tp_rank).reshape(-1, hidden_size)
+        qkv_w = torch.cat([qw, kw, vw], dim=0)
+        state_dict[f"language_model.encoder.layers.{pp_i}.self_attention.query_key_value.weight"].copy_(qkv_w)
+        state_dict[f"language_model.encoder.layers.{pp_i}.self_attention.dense.weight"].copy_(column_split(
+            get_weight_from_name(f"model.layers.{ori_i}.attention.wo.weight"), tp_size, tp_rank))
+
+        gate_proj = row_split(
+            get_weight_from_name(f"model.layers.{ori_i}.feed_forward.w1.weight"), tp_size, tp_rank)
+        up_proj = row_split(
+            get_weight_from_name(f"model.layers.{ori_i}.feed_forward.w3.weight"), tp_size, tp_rank)
+        state_dict[f"language_model.encoder.layers.{pp_i}.mlp.proj.weight"].copy_(torch.cat(
+            [gate_proj, up_proj], 0).contiguous().clone())
+        state_dict[f"language_model.encoder.layers.{pp_i}.mlp.dense_4h_to_h.weight"].copy_(column_split(
+            get_weight_from_name(f"model.layers.{ori_i}.feed_forward.w2.weight"), tp_size, tp_rank))
+        state_dict[f"language_model.encoder.layers.{pp_i}.input_layernorm.weight"].copy_(get_weight_from_name(
+            f"model.layers.{ori_i}.attention_norm.weight").clone())
+        state_dict[f"language_model.encoder.layers.{pp_i}.post_attention_layernorm.weight"].copy_(get_weight_from_name(
+            f"model.layers.{ori_i}.ffn_norm.weight").clone())
+
+    for pp_i in range(pp_n_layer):
+        if pretrain_type == 'llama':
+            layer_update(pp_i)
+        if pretrain_type == 'internlm2':
+            internlm2_layer_update(pp_i)
+
+    # if cfg_loader["deepspeed"]:
+    #     torch.npu.empty_cache()
+    # else:
+    #     optimizer.reload_model_params()
+    optimizer.reload_model_params()
+    return True
+
+
+def load_ckpt_pretrained(_args, model, optimizer, pretrain_type="llama"):
+    # worker = 0 # cfg_loader.get('worker', 8)
+    tp_rank = mpu.get_tensor_model_parallel_rank()
+    tp_size = mpu.get_tensor_model_parallel_world_size()
+    pp_rank = mpu.get_pipeline_model_parallel_rank()
+    pp_size = mpu.get_pipeline_model_parallel_world_size()
+    if not _args.group_query_attention:
+        num_kv_heads = _args.num_attention_heads
+    else:
+        num_kv_heads = _args.num_query_groups
+    success = load_ckpt_from_pretrain(_args, model, optimizer, tp_rank, tp_size, pp_rank, pp_size, 
+                                      _args.num_layers,
+                                      _args.hidden_size,
+                                      _args.num_attention_heads,
+                                      num_kv_heads,
+                                      pretrain_type=pretrain_type)
+    print(f"Successfully loaded checkpoint from {_args.load}.", flush=True)
+    # if success:
+    #     logger.info(f"Successfully loaded checkpoint from {cfg_loader['load_path']}.")
+    # else:
+    #     logger.info("Fail to load any checkpoints and will start from random.")
+
+
 def setup_model_and_optimizer(model_provider_func,
                               model_type,
                               no_wd_decay_cond=None,
@@ -546,18 +807,21 @@ def setup_model_and_optimizer(model_provider_func,
     opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
 
     if args.load is not None or args.pretrained_checkpoint is not None:
-        one_logger and one_logger.log_metrics({
-            'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()
-        })
-        timers('load-checkpoint', log_level=0).start(barrier=True)
-        args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
-            model, optimizer, opt_param_scheduler)
-        timers('load-checkpoint').stop(barrier=True)
-        timers.log(['load-checkpoint'])
-        one_logger and one_logger.log_metrics({
-            'load_checkpoint_finish_time': one_logger_utils.get_timestamp_in_ms(),
-            'load_checkpoint_time': timers('load-checkpoint').active_time()
-        })
+        load_ckpt_pretrained(args, model, optimizer, pretrain_type="llama")
+        args.iteration = 0
+        args.num_floating_point_operations_so_far = 0
+        # one_logger and one_logger.log_metrics({
+        #     'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()
+        # })
+        # timers('load-checkpoint', log_level=0).start(barrier=True)
+        # args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
+        #     model, optimizer, opt_param_scheduler)
+        # timers('load-checkpoint').stop(barrier=True)
+        # timers.log(['load-checkpoint'])
+        # one_logger and one_logger.log_metrics({
+        #     'load_checkpoint_finish_time': one_logger_utils.get_timestamp_in_ms(),
+        #     'load_checkpoint_time': timers('load-checkpoint').active_time()
+        # })
     else:
         args.iteration = 0
         args.num_floating_point_operations_so_far = 0
